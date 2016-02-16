@@ -20,6 +20,13 @@ import logging
 import random
 import types
 
+try:
+    from django.http import HttpResponse
+    from django.views.generic import View
+except ImportError:
+    View = object
+    using_django = True
+
 from google.appengine.api import taskqueue, modules
 from google.appengine.ext import ndb
 from google.appengine.ext.deferred import deferred
@@ -49,12 +56,12 @@ BACKGROUND_MODULE = None
 @ndb.tasklet
 def addTask(queues, func, *args, **kwargs):
     """ Enqueue a task to execute the specified function call later from the task queue.
-    
+
     Handle exceptions and dispatching to the right queue.
-    
+
     @param queues: List of queues names. We will randomly select one to push the task into.
                     Can be 'default' to use default queues.
-    
+
     @param func: The function to execute later
 
     @param _countdown: seconds to wait before calling the function
@@ -64,19 +71,19 @@ def addTask(queues, func, *args, **kwargs):
         Must match the _TASK_NAME_PATTERN regular expression: ^[a-zA-Z0-9_-]{1,500}$
     @param _target: specific version and/or module the task should execute on
     @param _raiseIfExists: if set to True, we raise the eventual TaskAlreadyExistsError
-    
+
     @return: A Future that will yield True if the task could be enqueued.
     @rtype: ndb.Future
     """
     if not isinstance(queues, list):
         queues = DEFAULT_QUEUES
-    
+
     _raiseIfExists = kwargs.pop('_raiseIfExists', False)
     taskName = kwargs.pop('_name', None)
     countdown = kwargs.pop('_countdown', None)
     eta = kwargs.pop('_eta', None)
     target = kwargs.pop('_target', None)
-    
+
     if not target and BACKGROUND_MODULE:
         # Tasks from the default module are executed into the background module.
         # Tasks from other modules (stage, background) stays inside their module.
@@ -84,12 +91,12 @@ def addTask(queues, func, *args, **kwargs):
             # Target mirror of current version to avoid compatibility issues
             # If that version does not exist, it will fall back to the default background version.
             target = modules.get_current_version_name() + '.' + BACKGROUND_MODULE
-    
+
     success = False
     try:
         yield _defer(queues, func, args, kwargs, countdown, eta, taskName, target)
         success = True
-            
+
     except (taskqueue.TaskAlreadyExistsError, taskqueue.TombstonedTaskError):
         # TaskAlreadyExistsError: a task with same name is in the queue
         # TombstonedTaskError: a task with same name has been in the queue recently
@@ -102,7 +109,7 @@ def addTask(queues, func, *args, **kwargs):
             logging.exception("Could not enqueue the task")
     except:
         logging.exception("Could not enqueue the task")
-    
+
     raise ndb.Return(success)
 
 
@@ -114,7 +121,7 @@ def isFromTaskQueue(request=None):
     # If your request handler finds any of these headers, it can trust that the request is a Task Queue request.
     # If any of the above headers are present in an external user request to your App, they are stripped.
     # The exception being requests from logged in administrators of the application, who are allowed to set the headers for testing purposes.
-    return bool(request.headers.get('X-Appengine-TaskName'))
+    return bool(request.META.get('HTTP_X_APPENGINE_TASKNAME'))
 
 
 def getRetryCount():
@@ -144,7 +151,7 @@ def logAsRetried(message, *args, **kwargs):
 def _defer(queues, func, funcArgs, funcKwargs, countdown=None, eta=None, taskName=None, target=None):
     """
     Our own implementation of deferred.defer.
-    
+
     This allows:
     - using webapp2 as deferred handler and applying our middlewares
     - using task asynchronous API
@@ -152,27 +159,77 @@ def _defer(queues, func, funcArgs, funcKwargs, countdown=None, eta=None, taskNam
     - logging headers at DEBUG level instead of INFO
     """
     payload = _serialize(func, funcArgs, funcKwargs)
-    
+
     queueName = random.choice(queues)
-    
+
     # We track which function is called so that it appears clearly in the App admin dash-board.
     # Note: if it's a class method, we only track the method name and not the class name.
     url = "/_cb/deferred/%s/%s" % (getattr(func, '__module__', ''), getattr(func, '__name__', ''))
-    
+
     headers = {"Content-Type": "application/octet-stream"}
-    
+
     task = taskqueue.Task(payload=payload, target=target, url=url, headers=headers,
                           countdown=countdown, eta=eta, name=taskName)
-    
+
     return task.add_async(queueName)
 
 
+class DeferredView(View):
+
+    # Queue & task name are already set in the request log.
+    # We don't care about country and name-space.
+    _SKIP_HEADERS = {'x_appengine_country', 'x_appengine_queuename', 'x_appengine_taskname',
+                     'x_appengine_current_namespace'}
+
+    def post(self, request, *args, **kwargs):
+        """ Executes a deferred task """
+        # Add some task debug information.
+        headers = []
+        # for key, value in self.request.headers.items():
+        for key, value in request.META.items():
+            k = key.lower()
+            if k.startswith("http_x_appengine_") and k not in self._SKIP_HEADERS:
+                headers.append("%s:%s" % (key, value))
+        logging.debug(", ".join(headers))
+
+        # Make sure all modules are loaded
+        if WARMUP_MODULE:
+            importlib.import_module(WARMUP_MODULE)
+
+        # Make sure we are called from the Task Queue (security)
+        if isFromTaskQueue(request):
+            try:
+                func, args, kwds = cPickle.loads(request.body)
+            except Exception:
+                logging.exception("Permanent failure attempting to execute task")
+                return
+
+            try:
+                func(*args, **kwds)
+            except TypeError:
+                logging.debug("Deferred function arguments: %s %s", args, kwds)
+                raise
+            except deferred.SingularTaskFailure as e:
+                msg = "Failure executing task, task retry forced"
+                if e.message:
+                    msg += ": %s" % e.message
+                logging.debug(msg)
+                return HttpResponse('', status=408)
+            except deferred.PermanentTaskFailure:
+                logging.exception("Permanent failure attempting to execute task")
+
+            return HttpResponse()
+        else:
+            logging.critical('Detected an attempted XSRF attack: we are not executing from a task queue.')
+            return HttpResponse(status=403)
+
+
 class DeferredHandler(webapp2.RequestHandler):
-    
+
     # Queue & task name are already set in the request log.
     # We don't care about country and name-space.
     _SKIP_HEADERS = {'x-appengine-country', 'x-appengine-queuename', 'x-appengine-taskname', 'x-appengine-current-namespace'}
-    
+
     def post(self, *args, **kwargs):
         """ Executes a deferred task """
         # Add some task debug information.
@@ -182,11 +239,11 @@ class DeferredHandler(webapp2.RequestHandler):
             if k.startswith("x-appengine-") and k not in self._SKIP_HEADERS:
                 headers.append("%s:%s" % (key, value))
         logging.debug(", ".join(headers))
-        
+
         # Make sure all modules are loaded
         if WARMUP_MODULE:
             importlib.import_module(WARMUP_MODULE)
-        
+
         # Make sure we are called from the Task Queue (security)
         if isFromTaskQueue(self.request):
             try:
@@ -194,7 +251,7 @@ class DeferredHandler(webapp2.RequestHandler):
             except Exception:
                 logging.exception("Permanent failure attempting to execute task")
                 return
-            
+
             try:
                 func(*args, **kwds)
             except TypeError:
@@ -208,8 +265,9 @@ class DeferredHandler(webapp2.RequestHandler):
                 self.response.set_status(408)
             except deferred.PermanentTaskFailure:
                 logging.exception("Permanent failure attempting to execute task")
-            
+
         else:
+            print('Detected an attempted XSRF attack: we are not executing from a task queue.')
             logging.critical('Detected an attempted XSRF attack: we are not executing from a task queue.')
             self.response.set_status(403)
 
@@ -220,7 +278,7 @@ class DeferredHandler(webapp2.RequestHandler):
 
 def _invokeMember(obj, memberName, *args, **kwargs):
     """Retrieves a member of an object, then calls it with the provided arguments.
-    
+
     Args:
       obj: The object to operate on.
       membername: The name of the member to retrieve from ojb.
@@ -234,10 +292,10 @@ def _invokeMember(obj, memberName, *args, **kwargs):
 
 def _curry_callable(obj, args, kwargs):
     """Takes a callable and arguments and returns a task queue tuple.
-    
+
     The returned tuple consists of (callable, args, kwargs), and can be pickled
     and unpickled safely.
-    
+
     Args:
       obj: The callable to curry. See the module docstring for restrictions.
       args: Positional arguments to call the callable with.
@@ -266,7 +324,7 @@ def _curry_callable(obj, args, kwargs):
 
 def _serialize(obj, args, kwargs):
     """Serializes a callable into a format recognized by the deferred executor.
-    
+
     Args:
       obj: The callable to serialize. See module docstring for restrictions.
       args: Positional arguments to call the callable with.
